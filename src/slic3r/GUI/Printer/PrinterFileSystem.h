@@ -15,6 +15,7 @@ using nlohmann::json;
 
 #include <functional>
 #include <deque>
+#include <atomic>
 
 wxDECLARE_EVENT(EVT_STATUS_CHANGED, wxCommandEvent);
 wxDECLARE_EVENT(EVT_MODE_CHANGED, wxCommandEvent);
@@ -205,6 +206,12 @@ public:
 
     void FetchModelCancel();
 
+    // Path to hand to the print job as dst_file. Transport-aware: in FTPS mode
+    // file.path keeps the FTP login-root prefix (e.g. "sdcard/") required for FTP
+    // transfers, but the printer's print command resolves the file relative to the
+    // SD-card root and re-adds that mount itself, so the prefix is stripped here.
+    std::string GetPrintFilePath(size_t index);
+
     size_t GetCount() const;
 
     size_t GetIndexAtTime(boost::uint32_t time);
@@ -364,6 +371,31 @@ private:
 
     int UploadFileTask(std::shared_ptr<UploadFile> upload_file, boost::uint64_t seq, std::string &msg);
 
+    // --- FTPS transport (LAN-only fallback) ---------------------------------
+    // When the printer is in LAN-only mode and the proprietary BambuSource tunnel
+    // is unavailable, files are browsed/downloaded/deleted over FTPS instead. The
+    // high-level operations below mirror their tunnel counterparts but run their
+    // blocking libcurl work on the receive thread (as queued tasks) and apply the
+    // results on the GUI thread via PostCallback, reusing the same wx events.
+    enum Transport { T_TUNNEL, T_FTPS };
+
+    void ParseFtpsUrl(std::string const &url);            // parse "bambu-ftp://" url (under m_mutex)
+    void FtpsPostTask(std::function<void()> const &task); // enqueue a blocking job onto the worker
+    void FtpsListAllFiles();
+    void FtpsDownloadNextFile();
+    void FtpsDeleteFilesContinue();
+    void FtpsFetchModel(size_t index, std::function<void(int, std::string const &)> callback);
+    void FtpsUpdateThumbnails(std::shared_ptr<std::vector<File>> files);
+    void FtpsApplyDownload(std::shared_ptr<Download> download, std::pair<FileType, std::string> type, int result, int progress, std::string const &error);
+    void FtpsApplyThumbnail(std::string const &path, std::string const &name, std::string const &img_bytes, std::map<std::string, std::string> const &metadata, bool ok);
+    bool FtpsAborted() const { return m_ftps_abort.load(); }
+
+    std::string FtpsRootDir() const;                      // e.g. "sdcard/"
+    std::vector<std::string> FtpsDirsForType(FileType type) const;
+    std::string FtpsCacheDir() const;                     // <data_dir>/ftps_cache/<dev_id>/<type>
+    static std::string FtpsCacheKey(File const &file);    // stable per (name,size)
+    void FtpsSyncCache(FileList const &files);            // drop cache entries no longer present
+
 protected:
     FileType m_file_type = F_INVALID_TYPE;
     std::string m_file_storage;
@@ -406,6 +438,18 @@ private:
 
     MediaAbilityList m_media_ability_list;
     std::map<boost::uint32_t, callback_t3>  m_produce_message_cb_map;
+
+    // FTPS transport state
+    Transport                         m_transport = T_TUNNEL;
+    std::string                       m_ftps_host;
+    int                               m_ftps_port = 990;
+    std::string                       m_ftps_user;
+    std::string                       m_ftps_passwd;
+    std::string                       m_ftps_root;
+    std::string                       m_ftps_device;
+    std::deque<std::function<void()>> m_ftps_tasks;
+    std::atomic<bool>                 m_ftps_abort{false};
+    std::atomic<bool>                 m_ftps_fetch_cancel{false}; // per-FetchModel cancel (dialog "Cancel")
 };
 
 #endif // !slic3r_GUI_PrinterFileSystem_h_

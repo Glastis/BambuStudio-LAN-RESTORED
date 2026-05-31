@@ -265,6 +265,7 @@ void MediaFilePanel::UpdateByObj(MachineObject* obj)
         m_lan_mode     = obj->is_lan_mode_printer();
         m_lan_ip       = obj->get_dev_ip();
         m_lan_passwd   = obj->get_access_code();
+        m_ftp_root     = obj->get_ftp_folder();
         m_dev_ver      = obj->get_ota_version();
         m_device_busy  = obj->is_camera_busy_off();
         m_local_proto  = obj->file_local;
@@ -288,6 +289,7 @@ void MediaFilePanel::UpdateByObj(MachineObject* obj)
         m_lan_mode  = false;
         m_lan_ip.clear();
         m_lan_passwd.clear();
+        m_ftp_root.clear();
         m_dev_ver.clear();
         m_device_busy = false;
         m_local_proto = 0;
@@ -597,8 +599,29 @@ void MediaFilePanel::fetchUrl(boost::weak_ptr<PrinterFileSystem> wfs)
         return;
     }
     if (m_lan_mode) {
-        m_image_grid->SetStatus(m_bmp_failed, _L("Browsing file in storage is not supported in LAN Only Mode."));
-        fs->SetUrl("0");
+        // The proprietary tunnel is unavailable in LAN-Only mode, but the printer
+        // still exposes its files over FTPS (user "bblp", password = access code).
+        // Browse them transparently instead of blocking.
+        if (m_lan_ip.empty()) {
+            m_image_grid->SetStatus(m_bmp_failed, _L("Please enter the IP of printer to connect."));
+            fs->SetUrl("0");
+            return;
+        }
+        if (m_lan_passwd.empty()) {
+            // No access code on record: ask for it, persist it, then retry.
+            m_image_grid->SetStatus(m_bmp_failed, _L("Please enter the access code of the printer to browse its storage."));
+            fs->SetUrl("0");
+            fs.reset();
+            if (wxGetApp().show_modal_ip_address_enter_dialog(false, _L("LAN Connection Failed (Failed to view sdcard)"))) {
+                if (auto fs = wfs.lock())
+                    fs->Retry();
+            }
+            return;
+        }
+        std::string url = "bambu-ftp://" + m_lan_ip + "?port=990&user=" + m_lan_user + "&passwd=" + m_lan_passwd;
+        url += "&root=" + m_ftp_root;
+        url += "&device=" + m_machine;
+        fs->SetUrl(url);
         return;
     }
     if (agent) {
@@ -700,10 +723,10 @@ void MediaFilePanel::doAction(size_t index, int action)
 
                     auto &file = fs->GetFile(index);
 
-                    std::string file_path = file.path;
-                    if (!file_path.empty() && file_path[0] == '/') {
-                        file_path.erase(0, 1);
-                    }
+                    // Transport-aware dst_file: for FTPS this strips the FTP root
+                    // prefix (e.g. "sdcard/") that the printer would otherwise
+                    // double up, causing HMS 05004002 ("Unsupported print file path").
+                    std::string file_path = fs->GetPrintFilePath(index);
 
                     int gcode_file_count = Slic3r::GUI::wxGetApp().plater()->update_print_required_data(config, model, plate_data_list, file.name, file_path);
 

@@ -5,19 +5,27 @@
 #include "slic3r/GUI/I18N.hpp"
 
 #include "../../Utils/NetworkAgent.hpp"
+#include "../../Utils/FtpsClient.hpp"
 #include "../BitmapCache.hpp"
 
 #include <boost/algorithm/hex.hpp>
+#include <boost/algorithm/string.hpp>
 #include <boost/endian/conversion.hpp>
 #include <boost/log/trivial.hpp>
 #include <boost/uuid/detail/md5.hpp>
 #include <boost/regex.hpp>
+#include <boost/filesystem.hpp>
+#include <boost/filesystem/fstream.hpp>
 
 #include <wx/mstream.h>
+#include <wx/image.h>
 
 #include "nlohmann/json.hpp"
 
 #include <cstring>
+#include <cctype>
+#include <set>
+#include <algorithm>
 
 #ifndef NDEBUG
 //#define PRINTER_FILE_SYSTEM_TEST
@@ -137,7 +145,10 @@ void PrinterFileSystem::SetFileType(FileType type, std::string const &storage)
     SendChangedEvent(EVT_FILE_CHANGED);
     if (type == F_INVALID_TYPE)
         return;
-    if (m_session.tunnel == nullptr)
+    // FTPS has no tunnel: still trigger a re-sync so switching type/storage reloads.
+    if (m_transport == T_TUNNEL && m_session.tunnel == nullptr)
+        return;
+    if (m_transport == T_FTPS && m_stopped)
         return;
     m_status = Status::ListSyncing;
     SendChangedEvent(EVT_STATUS_CHANGED, m_status);
@@ -164,6 +175,10 @@ size_t PrinterFileSystem::EnterSubGroup(size_t index)
 
 void PrinterFileSystem::ListAllFiles()
 {
+    if (m_transport == T_FTPS) {
+        FtpsListAllFiles();
+        return;
+    }
     json req;
     char const * types[] {"timelapse","video", "model" };
     req["type"] = types[m_file_type];
@@ -502,6 +517,10 @@ void PrinterFileSystem::FetchModel(size_t index, std::function<void(int, std::st
 {
     if (m_task_flags & FF_FETCH_MODEL)
         return;
+    if (m_transport == T_FTPS) {
+        FtpsFetchModel(index, callback);
+        return;
+    }
     json req;
     json arr;
     if (index == (size_t) -1) return;
@@ -548,7 +567,54 @@ void PrinterFileSystem::FetchModel(size_t index, std::function<void(int, std::st
 void PrinterFileSystem::FetchModelCancel()
 {
     if ((m_task_flags & FF_FETCH_MODEL) == 0) return;
+    if (m_transport == T_FTPS) {
+        m_ftps_fetch_cancel = true; // checked by the FTPS download progress callback
+        return;
+    }
     CancelRequests2({m_fetch_model_seq});
+}
+
+// LAN-only counterpart of FetchModel: the proprietary tunnel is unavailable, so
+// fetch the whole .3mf over FTPS instead. The caller (MediaFilePanel) feeds the
+// returned bytes to load_gcode_3mf_from_stream, which accepts the full archive
+// just as well as the tunnel's re-zipped subset. Blocking libcurl work runs on
+// the worker; the result is applied on the GUI thread via PostCallback.
+void PrinterFileSystem::FtpsFetchModel(size_t index, std::function<void(int, std::string const &)> callback)
+{
+    if (index == (size_t) -1 || index >= m_file_list.size())
+        return;
+    auto &      file   = m_file_list[index];
+    std::string remote = file.path.empty() ? (FtpsRootDir() + file.name) : file.path;
+    std::string host = m_ftps_host, user = m_ftps_user, pass = m_ftps_passwd;
+    int         port = m_ftps_port;
+
+    m_task_flags |= FF_FETCH_MODEL;
+    m_ftps_fetch_cancel = false;
+
+    FtpsPostTask([this, remote, host, port, user, pass, callback]() {
+        Slic3r::FtpsClient client(host, port, user, pass);
+        std::string        data, err;
+        bool               ok = client.download_to_string(
+            remote, data,
+            [this](std::uint64_t, std::uint64_t) { return !m_ftps_fetch_cancel.load() && !FtpsAborted(); },
+            err);
+
+        int         result = SUCCESS;
+        std::string payload;
+        if (m_ftps_fetch_cancel.load() || FtpsAborted()) {
+            result = ERROR_CANCEL; // dialog was cancelled / panel stopped — stay silent
+        } else if (ok && !data.empty()) {
+            result  = SUCCESS;
+            payload = std::move(data); // full .3mf, parsed by the GUI callback
+        } else {
+            result  = FILE_READ_WRITE_ERR; // any non-zero, non-cancel code shows `payload`
+            payload = err;                 // real FTPS error (empty -> generic message in MediaFilePanel)
+        }
+        PostCallback([this, callback, result, payload]() {
+            m_task_flags &= ~FF_FETCH_MODEL;
+            callback(result, payload);
+        });
+    });
 }
 
 size_t PrinterFileSystem::GetCount() const
@@ -664,6 +730,39 @@ PrinterFileSystem::File const &PrinterFileSystem::GetFile(size_t index, bool &se
     return m_file_list[m_group_month[index]];
 }
 
+std::string PrinterFileSystem::GetPrintFilePath(size_t index)
+{
+    File const & file = GetFile(index);
+    std::string  path = file.path;
+    // Tunnel native paths historically carry a leading '/'; the print command
+    // wants it gone (preserves the previous MediaFilePanel behaviour).
+    if (!path.empty() && path.front() == '/')
+        path.erase(0, 1);
+    // FTPS: file.path keeps the FTP login-root prefix (e.g. "sdcard/") needed to
+    // transfer the file over FTP, but start_sdcard_print resolves dst_file
+    // relative to the SD-card root and re-adds that mount itself. Leaving the
+    // prefix in yields ".../sdcard/sdcard/..." which the firmware rejects with
+    // HMS 05004002 ("Unsupported print file path or name").
+    if (m_transport == T_FTPS) {
+        std::string root = FtpsRootDir(); // e.g. "sdcard/"
+        if (!root.empty() && path.compare(0, root.size(), root) == 0)
+            path.erase(0, root.size());
+    }
+    // Diagnostic breadcrumb: the studio log body is encrypted, so record the exact
+    // dst_file handed to the print job in a plaintext sidecar. Lets the path format
+    // be verified on real hardware; safe to remove once confirmed.
+    try {
+        boost::filesystem::path dbg = boost::filesystem::path(Slic3r::data_dir()) / "ftps_cache" / "last_sdcard_print_path.txt";
+        boost::filesystem::create_directories(dbg.parent_path());
+        boost::filesystem::ofstream ofs(dbg, std::ios::trunc);
+        ofs << "transport=" << (m_transport == T_FTPS ? "ftps" : "tunnel") << "\n"
+            << "raw_path="  << file.path << "\n"
+            << "ftp_root="  << FtpsRootDir() << "\n"
+            << "dst_file="  << path << "\n";
+    } catch (...) {}
+    return path;
+}
+
 void PrinterFileSystem::Attached()
 {
     boost::unique_lock lock(m_mutex);
@@ -704,6 +803,7 @@ void PrinterFileSystem::Stop(bool quit)
         return;
     }
     m_stopped = true;
+    m_ftps_abort = true; // abort any in-flight FTPS transfer
     m_cond.notify_all();
 
 }
@@ -762,6 +862,10 @@ void PrinterFileSystem::UpdateGroupSelect()
 
 void PrinterFileSystem::DeleteFilesContinue()
 {
+    if (m_transport == T_FTPS) {
+        FtpsDeleteFilesContinue();
+        return;
+    }
     std::vector<size_t> indexes;
     std::vector<std::string> names;
     std::vector<std::string> paths;
@@ -803,6 +907,10 @@ void PrinterFileSystem::DeleteFilesContinue()
 
 void PrinterFileSystem::DownloadNextFile()
 {
+    if (m_transport == T_FTPS) {
+        FtpsDownloadNextFile();
+        return;
+    }
     size_t index = size_t(-1);
     for (size_t i = 0; i < m_file_list.size(); ++i) {
         if (m_file_list[i].IsDownload() && m_file_list[i].DownloadProgress() == -1) {
@@ -949,6 +1057,10 @@ void PrinterFileSystem::UpdateFocusThumbnail()
     if (names.empty() && paths.empty())
         return;
     m_task_flags |= FF_THUMNAIL;
+    if (m_transport == T_FTPS) {
+        FtpsUpdateThumbnails(std::make_shared<std::vector<File>>(paths.empty() ? names : paths));
+        return;
+    }
     UpdateFocusThumbnail2(std::make_shared<std::vector<File>>(paths.empty() ? names : paths),
         paths.empty() ? OldThumbnail : m_file_type == F_MODEL ? ModelMetadata : VideoThumbnail);
 }
@@ -1187,6 +1299,470 @@ void PrinterFileSystem::FileRemoved(std::pair<FileType, std::string> type, size_
         }
     }
     file_index.first.erase(file_index.first.begin() + index);
+}
+
+// ===========================================================================
+// FTPS transport (LAN-only fallback)
+// ===========================================================================
+
+static bool ftps_keep(PrinterFileSystem::FileType type, std::string const &name)
+{
+    std::string lower = boost::to_lower_copy(name);
+    if (type == PrinterFileSystem::F_MODEL)
+        return boost::ends_with(lower, ".3mf") || boost::ends_with(lower, ".gcode.3mf");
+    // F_TIMELAPSE / F_VIDEO
+    return boost::ends_with(lower, ".mp4") || boost::ends_with(lower, ".avi");
+}
+
+void PrinterFileSystem::ParseFtpsUrl(std::string const &url)
+{
+    m_transport  = T_FTPS;
+    m_ftps_abort = false;
+    m_ftps_tasks.clear();
+
+    std::string s = url.substr(std::string("bambu-ftp://").size());
+    std::string host = s, query;
+    auto        q = s.find('?');
+    if (q != std::string::npos) {
+        host  = s.substr(0, q);
+        query = s.substr(q + 1);
+    }
+    m_ftps_host = host;
+    m_ftps_port = 990;
+    m_ftps_user = "bblp";
+    m_ftps_passwd.clear();
+    m_ftps_root.clear();
+    m_ftps_device.clear();
+
+    std::vector<std::string> parts;
+    boost::split(parts, query, boost::is_any_of("&"));
+    for (auto &p : parts) {
+        auto eq = p.find('=');
+        if (eq == std::string::npos)
+            continue;
+        std::string k = p.substr(0, eq), v = p.substr(eq + 1);
+        if (k == "port")
+            m_ftps_port = atoi(v.c_str());
+        else if (k == "user")
+            m_ftps_user = v;
+        else if (k == "passwd")
+            m_ftps_passwd = v;
+        else if (k == "root")
+            m_ftps_root = v;
+        else if (k == "device")
+            m_ftps_device = v;
+    }
+}
+
+void PrinterFileSystem::FtpsPostTask(std::function<void()> const &task)
+{
+    boost::unique_lock l(m_mutex);
+    m_ftps_tasks.push_back(task);
+    m_cond.notify_all();
+}
+
+std::string PrinterFileSystem::FtpsRootDir() const
+{
+    std::string root = m_ftps_root;
+    if (!root.empty() && root.back() != '/')
+        root += '/';
+    return root;
+}
+
+std::vector<std::string> PrinterFileSystem::FtpsDirsForType(FileType type) const
+{
+    std::string              root = FtpsRootDir();
+    std::vector<std::string> dirs;
+    auto add = [&dirs](std::string const &d) {
+        if (std::find(dirs.begin(), dirs.end(), d) == dirs.end())
+            dirs.push_back(d);
+    };
+    if (type == F_MODEL) {
+        add(root);
+        add(root + "model/");
+        add(root + "cache/");
+        add("model/");
+        add("cache/");
+    } else { // F_TIMELAPSE / F_VIDEO
+        add(root + "timelapse/");
+        add("timelapse/");
+    }
+    return dirs;
+}
+
+std::string PrinterFileSystem::FtpsCacheDir() const
+{
+    char const *tnames[] = {"timelapse", "video", "model"};
+    std::string t   = (m_file_type >= 0 && m_file_type < 3) ? tnames[m_file_type] : "other";
+    std::string dev = m_ftps_device.empty() ? "unknown" : m_ftps_device;
+    boost::filesystem::path dir = boost::filesystem::path(Slic3r::data_dir()) / "ftps_cache" / dev / t;
+    boost::system::error_code ec;
+    boost::filesystem::create_directories(dir, ec);
+    return dir.string();
+}
+
+std::string PrinterFileSystem::FtpsCacheKey(File const &file)
+{
+    std::string s;
+    for (char c : file.name)
+        s += std::isalnum((unsigned char) c) ? c : '_';
+    s += "_" + std::to_string(file.size);
+    return s;
+}
+
+void PrinterFileSystem::FtpsSyncCache(FileList const &files)
+{
+    std::string             dir = FtpsCacheDir();
+    std::set<std::string>   keys;
+    for (auto const &f : files)
+        keys.insert(FtpsCacheKey(f));
+    boost::system::error_code   ec;
+    boost::filesystem::path     p(dir);
+    if (!boost::filesystem::is_directory(p, ec))
+        return;
+    for (boost::filesystem::directory_iterator it(p, ec), end; it != end; it.increment(ec)) {
+        auto        path = it->path();
+        std::string ext  = path.extension().string();
+        if (ext != ".thumb" && ext != ".json")
+            continue;
+        if (keys.find(path.stem().string()) == keys.end()) {
+            boost::system::error_code ec2;
+            boost::filesystem::remove(path, ec2);
+        }
+    }
+}
+
+void PrinterFileSystem::FtpsListAllFiles()
+{
+    FileType                 type = m_file_type;
+    std::vector<std::string> dirs = FtpsDirsForType(type);
+    std::string host = m_ftps_host;
+    int         port = m_ftps_port;
+    std::string user = m_ftps_user, pass = m_ftps_passwd;
+
+    FtpsPostTask([this, type, dirs, host, port, user, pass]() {
+        Slic3r::FtpsClient            client(host, port, user, pass);
+        std::vector<Slic3r::FtpsEntry> chosen;
+        std::string                    chosen_dir;
+        bool                           listed_ok = false;
+        std::string                    error;
+        for (auto const &dir : dirs) {
+            if (FtpsAborted())
+                return;
+            std::vector<Slic3r::FtpsEntry> entries;
+            std::string                    err;
+            if (!client.list(dir, entries, err)) {
+                error = err;
+                continue;
+            }
+            listed_ok = true;
+            std::vector<Slic3r::FtpsEntry> kept;
+            for (auto &e : entries) {
+                if (e.is_dir)
+                    continue;
+                if (ftps_keep(type, e.name))
+                    kept.push_back(e);
+            }
+            if (!kept.empty()) {
+                chosen.swap(kept);
+                chosen_dir = dir;
+                break;
+            }
+            if (chosen_dir.empty())
+                chosen_dir = dir; // remember a successful-but-empty directory
+        }
+        BOOST_LOG_TRIVIAL(info) << "PrinterFileSystem::FtpsListAllFiles dir=" << chosen_dir
+                                << " count=" << chosen.size() << " ok=" << listed_ok;
+
+        auto files = std::make_shared<FileList>();
+        for (auto &e : chosen) {
+            File f;
+            f.name  = e.name;
+            f.path  = chosen_dir + e.name;
+            f.time  = e.time;
+            f.size  = e.size;
+            f.flags = 0;
+            files->push_back(std::move(f));
+        }
+        bool        ok       = listed_ok;
+        std::string err_copy = error;
+        PostCallback([this, files, type, ok, err_copy]() {
+            if (type != m_file_type)
+                return;
+            if (!ok) {
+                m_last_error = ERROR_PIPE;
+                m_status     = Status::Failed;
+                m_file_list.clear();
+                BuildGroups();
+                UpdateGroupSelect();
+                SendChangedEvent(EVT_STATUS_CHANGED, m_status, err_copy, m_last_error);
+                SendChangedEvent(EVT_FILE_CHANGED);
+                return;
+            }
+            m_file_list.swap(*files);
+            for (auto &file : m_file_list)
+                file.thumbnail = default_thumbnail;
+            std::sort(m_file_list.begin(), m_file_list.end());
+            BuildGroups();
+            UpdateGroupSelect();
+            m_last_error = 0;
+            m_status     = Status::ListReady;
+            SendChangedEvent(EVT_STATUS_CHANGED, m_status);
+            SendChangedEvent(EVT_FILE_CHANGED);
+            FtpsSyncCache(m_file_list);
+        });
+    });
+}
+
+void PrinterFileSystem::FtpsDownloadNextFile()
+{
+    size_t index = size_t(-1);
+    for (size_t i = 0; i < m_file_list.size(); ++i) {
+        if (m_file_list[i].IsDownload() && m_file_list[i].DownloadProgress() == -1) {
+            index = i;
+            break;
+        }
+    }
+    m_task_flags &= ~FF_DOWNLOAD;
+    if (index >= m_file_list.size())
+        return;
+    auto &file = m_file_list[index];
+    SendChangedEvent(EVT_DOWNLOAD, index, file.name);
+    std::shared_ptr<Download> download(file.download);
+    download->index = index;
+    download->name  = file.name;
+    download->path  = file.path;
+    m_task_flags |= FF_DOWNLOAD;
+
+    std::string remote = file.path.empty() ? (FtpsRootDir() + file.name) : file.path;
+    std::string host = m_ftps_host;
+    int         port = m_ftps_port;
+    std::string user = m_ftps_user, pass = m_ftps_passwd;
+    auto        type = std::make_pair(m_file_type, m_file_storage);
+
+    FtpsPostTask([this, download, remote, host, port, user, pass, type]() {
+        Slic3r::FtpsClient          client(host, port, user, pass);
+        boost::filesystem::ofstream ofs;
+        ofs.open(download->local_path, std::ios::binary);
+        int         result = SUCCESS;
+        std::string error;
+        if (!ofs) {
+            error  = last_system_error();
+            result = FILE_OPEN_ERR;
+        } else {
+            auto last_pct = std::make_shared<int>(-1);
+            auto prog     = [this, download, type, last_pct](std::uint64_t now, std::uint64_t total) -> bool {
+                if (FtpsAborted())
+                    return false;
+                int pct = total ? int(now * 100 / total) : 0;
+                if (pct != *last_pct) {
+                    *last_pct = pct;
+                    PostCallback([this, download, type, pct] { FtpsApplyDownload(download, type, CONTINUE, pct, std::string()); });
+                }
+                return true;
+            };
+            bool okdl = client.download(remote, ofs, prog, error);
+            ofs.flush();
+            ofs.close();
+            if (!okdl) {
+                boost::system::error_code ec;
+                boost::filesystem::remove(download->local_path, ec);
+                result = FtpsAborted() ? ERROR_CANCEL : ERROR_PIPE;
+            }
+        }
+        int         final_result = result;
+        std::string err          = error;
+        PostCallback([this, download, type, final_result, err]() {
+            FtpsApplyDownload(download, type, final_result, final_result == SUCCESS ? 100 : 0, err);
+        });
+    });
+}
+
+void PrinterFileSystem::FtpsApplyDownload(std::shared_ptr<Download> download, std::pair<FileType, std::string> type, int result, int progress, std::string const &error)
+{
+    if (result == CONTINUE && download->progress == progress)
+        return;
+    download->progress = progress;
+    if (download->index != size_t(-1)) {
+        auto file_index = FindFile(type, download->index, download->path.empty() ? download->name : download->path, !download->path.empty());
+        download->index = file_index.second;
+        if (download->index != size_t(-1)) {
+            auto &file = file_index.first[download->index];
+            if (result == CONTINUE)
+                ;
+            else if (result == SUCCESS)
+                file.download.reset(), file.local_path = download->local_path;
+            else if (result == ERROR_CANCEL)
+                file.download.reset(), file.flags &= ~FF_DOWNLOAD;
+            else
+                file.download.reset();
+            if (&file_index.first == &m_file_list)
+                SendChangedEvent(EVT_DOWNLOAD, download->index, result ? error : file.local_path, result);
+        }
+    }
+    if (result != CONTINUE)
+        DownloadNextFile();
+}
+
+void PrinterFileSystem::FtpsDeleteFilesContinue()
+{
+    std::vector<size_t>      indexes;
+    std::vector<std::string> names;
+    std::vector<std::string> paths;
+    std::vector<std::string> cache_keys;
+    for (size_t i = 0; i < m_file_list.size(); ++i) {
+        if ((m_file_list[i].flags & FF_DELETED) && !m_file_list[i].name.empty()) {
+            auto &file = m_file_list[i];
+            indexes.push_back(i);
+            names.push_back(file.name);
+            paths.push_back(file.path.empty() ? (FtpsRootDir() + file.name) : file.path);
+            cache_keys.push_back(FtpsCacheKey(file));
+        }
+    }
+    m_task_flags &= ~FF_DELETED;
+    if (indexes.empty())
+        return;
+    m_task_flags |= FF_DELETED;
+
+    auto        type      = std::make_pair(m_file_type, m_file_storage);
+    std::string host      = m_ftps_host;
+    int         port      = m_ftps_port;
+    std::string user      = m_ftps_user, pass = m_ftps_passwd;
+    std::string cache_dir = FtpsCacheDir();
+
+    FtpsPostTask([this, indexes, names, paths, cache_keys, type, host, port, user, pass, cache_dir]() {
+        Slic3r::FtpsClient client(host, port, user, pass);
+        std::vector<bool>  oks(paths.size(), false);
+        for (size_t i = 0; i < paths.size(); ++i) {
+            if (FtpsAborted())
+                break;
+            std::string err;
+            oks[i] = client.remove(paths[i], err);
+            if (oks[i]) {
+                boost::system::error_code ec;
+                boost::filesystem::remove(boost::filesystem::path(cache_dir) / (cache_keys[i] + ".thumb"), ec);
+                boost::filesystem::remove(boost::filesystem::path(cache_dir) / (cache_keys[i] + ".json"), ec);
+            }
+        }
+        PostCallback([this, indexes, names, type, oks]() {
+            int removed = 0;
+            for (size_t i = indexes.size(); i-- > 0;) {
+                if (i < oks.size() && oks[i]) {
+                    FileRemoved(type, indexes[i], names[i], false);
+                    ++removed;
+                } else {
+                    auto fi = FindFile(type, indexes[i], names[i], false);
+                    if (fi.second != size_t(-1))
+                        fi.first[fi.second].flags &= ~FF_DELETED;
+                }
+            }
+            if (removed)
+                SendChangedEvent(EVT_FILE_CHANGED, removed);
+            DeleteFilesContinue();
+        });
+    });
+}
+
+void PrinterFileSystem::FtpsUpdateThumbnails(std::shared_ptr<std::vector<File>> files)
+{
+    FileType    type = m_file_type;
+    std::string host = m_ftps_host;
+    int         port = m_ftps_port;
+    std::string user = m_ftps_user, pass = m_ftps_passwd;
+    std::string cache_dir = FtpsCacheDir();
+
+    FtpsPostTask([this, files, type, host, port, user, pass, cache_dir]() {
+        Slic3r::FtpsClient client(host, port, user, pass);
+        for (auto &f : *files) {
+            if (FtpsAborted())
+                break;
+            std::string key        = FtpsCacheKey(f);
+            std::string thumb_path = (boost::filesystem::path(cache_dir) / (key + ".thumb")).string();
+            std::string meta_path  = (boost::filesystem::path(cache_dir) / (key + ".json")).string();
+            std::string img_bytes;
+            std::map<std::string, std::string> meta;
+            bool        ok = false;
+
+            // 1. Cache hit?
+            {
+                boost::filesystem::ifstream ifs(thumb_path, std::ios::binary);
+                if (ifs) {
+                    std::ostringstream ss;
+                    ss << ifs.rdbuf();
+                    img_bytes = ss.str();
+                    ok        = !img_bytes.empty();
+                }
+            }
+            if (ok) {
+                boost::filesystem::ifstream mfs(meta_path);
+                if (mfs) {
+                    try {
+                        json j;
+                        mfs >> j;
+                        for (auto it = j.begin(); it != j.end(); ++it)
+                            meta[it.key()] = it.value().get<std::string>();
+                    } catch (...) {}
+                }
+            }
+
+            // 2. Cache miss: only models have a usable embedded thumbnail over FTPS.
+            if (!ok && type == F_MODEL) {
+                std::string data, err;
+                if (client.download_to_string(f.path, data, nullptr, err) && !data.empty()) {
+                    {
+                        std::istringstream iss(data, std::ios::binary);
+                        File               tmp;
+                        ParseThumbnail(tmp, iss);
+                        meta = tmp.metadata;
+                    }
+                    std::string tmpfile = (boost::filesystem::path(cache_dir) / (key + ".3mf.tmp")).string();
+                    {
+                        boost::filesystem::ofstream tof(tmpfile, std::ios::binary);
+                        tof.write(data.data(), data.size());
+                    }
+                    img_bytes = Slic3r::bbs_3mf_get_thumbnail(tmpfile.c_str());
+                    boost::system::error_code ec;
+                    boost::filesystem::remove(tmpfile, ec);
+                    ok = !img_bytes.empty();
+                    if (ok) {
+                        boost::filesystem::ofstream tof(thumb_path, std::ios::binary);
+                        tof.write(img_bytes.data(), img_bytes.size());
+                    }
+                    json j;
+                    for (auto &kv : meta)
+                        j[kv.first] = kv.second;
+                    boost::filesystem::ofstream mof(meta_path);
+                    mof << j.dump();
+                }
+            }
+
+            std::string path = f.path, name = f.name;
+            PostCallback([this, path, name, img_bytes, meta, ok]() { FtpsApplyThumbnail(path, name, img_bytes, meta, ok); });
+        }
+        PostCallback([this]() {
+            m_task_flags &= ~FF_THUMNAIL;
+            if (!m_stopped)
+                UpdateFocusThumbnail();
+        });
+    });
+}
+
+void PrinterFileSystem::FtpsApplyThumbnail(std::string const &path, std::string const &name, std::string const &img_bytes, std::map<std::string, std::string> const &metadata, bool ok)
+{
+    auto iter = std::find_if(m_file_list.begin(), m_file_list.end(), [&path](File &f) { return f.path == path; });
+    if (iter == m_file_list.end())
+        return;
+    iter->flags |= FF_THUMNAIL; // mark done (even on failure) so it is not retried forever
+    if (!metadata.empty())
+        iter->metadata = metadata;
+    if (ok && !img_bytes.empty()) {
+        wxMemoryInputStream mis(img_bytes.data(), img_bytes.size());
+        wxImage             img;
+        if (img.LoadFile(mis, wxBITMAP_TYPE_ANY) && img.IsOk())
+            iter->thumbnail = wxBitmap(img);
+    }
+    int index = iter - m_file_list.begin();
+    SendChangedEvent(EVT_THUMBNAIL, index, name);
 }
 
 struct CallbackEvent : wxCommandEvent
@@ -1535,6 +2111,21 @@ void PrinterFileSystem::RecvMessageThread()
                 break;
             }
         }
+        if (m_transport == T_FTPS) {
+            // FTPS task pump: run queued blocking jobs (list/download/delete/thumbnail).
+            // The jobs apply their results on the GUI thread via PostCallback.
+            if (!m_ftps_tasks.empty()) {
+                auto task = std::move(m_ftps_tasks.front());
+                m_ftps_tasks.pop_front();
+                l.unlock();
+                task();
+                l.lock();
+            } else {
+                // No polling needed: FtpsPostTask / Start / Stop all notify the cond.
+                m_cond.wait(l);
+            }
+            continue;
+        }
         if (m_messages.empty() && !m_produce_message_cb_map.empty()) {
             auto it = m_produce_message_cb_map.begin();
             while(it != m_produce_message_cb_map.end()) {
@@ -1729,6 +2320,13 @@ void PrinterFileSystem::Reconnect(boost::unique_lock<boost::mutex> &l, int resul
         if (m_stopped || m_messages.empty()) continue;
         std::string url = m_messages.front();
         m_messages.clear();
+        if (boost::starts_with(url, "bambu-ftp://")) {
+            // LAN-only FTPS fallback: no proprietary tunnel, browse over FTPS instead.
+            ParseFtpsUrl(url);
+            BOOST_LOG_TRIVIAL(info) << "PrinterFileSystem::Reconnect FTPS mode for " << m_ftps_host;
+            break;
+        }
+        m_transport = T_TUNNEL;
         if (url.size() < 2) {
             BOOST_LOG_TRIVIAL(info) << "PrinterFileSystem::Reconnect Initialize failed:";
             m_last_error = atoi(url.c_str());

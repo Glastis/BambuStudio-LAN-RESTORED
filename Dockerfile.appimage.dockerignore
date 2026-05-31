@@ -1,0 +1,32 @@
+# Build context filter for Dockerfile.appimage (BuildKit reads
+# <dockerfile>.dockerignore in preference to .dockerignore).
+#
+# Goal: keep the context small without dropping anything the build needs.
+# The big win is excluding .git (~870 MB). Source, resources and deps stay.
+
+.git
+.gitignore
+
+# Build outputs / our own export dir (avoid copying results back in).
+dist/
+build/
+/build/
+deps/build/
+deps/build-linux/
+
+# Editor / OS / object cruft.
+**/*.o
+**/*.log
+**/.DS_Store
+.vs/
+.vscode/
+
+# Docker tooling itself — not needed inside the image.
+Dockerfile
+Dockerfile.appimage
+Dockerfile.appimage.dockerignore
+Containerfile
+DockerBuild.sh
+DockerRun.sh
+DockerEntrypoint.sh
+scripts/build-appimage-docker.sh

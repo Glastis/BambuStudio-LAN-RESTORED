@@ -1,0 +1,64 @@
+# syntax=docker/dockerfile:1
+#
+# Disposable image that builds the BambuStudio AppImage on Debian trixie.
+#
+# It is NOT meant to be kept: scripts/build-appimage-docker.sh builds it on an
+# isolated buildx builder, exports ONLY the resulting AppImage to the host
+# (final `scratch` stage + `--output type=local`), then removes the builder and
+# its entire cache. Nothing of this image survives on the host afterwards.
+#
+# Base is debian:trixie-slim on purpose: it matches the host glibc (so the
+# AppImage runs locally) and is usually already present (no extra pull).
+
+FROM debian:trixie-slim AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV LC_ALL=C.UTF-8
+# Build the AppImage without FUSE: the runtime self-extracts instead of mounting.
+ENV APPIMAGE_EXTRACT_AND_RUN=1
+ENV container=docker
+
+WORKDIR /src
+
+# The project's BuildLinux.sh installs system deps via `sudo apt ...`. We are
+# root inside the build, so provide a no-op `sudo` shim instead of pulling the
+# real sudo. ca-certificates/wget are needed for the https downloads the deps
+# build and appimagetool perform; the slim base ships neither.
+RUN printf '#!/bin/sh\nexec "$@"\n' > /usr/local/bin/sudo \
+    && chmod +x /usr/local/bin/sudo \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates wget file \
+    && rm -rf /var/lib/apt/lists/* \
+    # Make build_appimage.sh take its in-container code path.
+    && touch /.dockerenv
+
+# Install the system build prerequisites. We parse the package list straight
+# from the project's own linux.d/debian (single source of truth) rather than
+# calling `BuildLinux.sh -u`: that script runs under `set -e`, and the list's
+# first line probes `dpkg -l libgtk*`, which fails on a clean image (no GTK yet)
+# and aborts before anything installs. libwebkit2gtk-4.1-dev is the one extra
+# the -u path appends to the base list. Copying linux.d alone keeps this
+# expensive layer cached when only sources change later.
+COPY linux.d ./linux.d
+RUN set -eux; \
+    pkgs="$(awk '/REQUIRED_DEV_PACKAGES=\(/{f=1;next} /^\)/{f=0} f{print $1}' linux.d/debian)"; \
+    apt-get update; \
+    apt-get install -y $pkgs libwebkit2gtk-4.1-dev; \
+    rm -rf /var/lib/apt/lists/*
+
+# Full working tree (includes any uncommitted changes — that is the point here).
+COPY . .
+
+# Build bundled deps, the app, then the AppImage. `-r` skips the RAM/disk guard,
+# which reads host-wide values inside the container and may misfire.
+RUN ./BuildLinux.sh -r -d \
+    && ./BuildLinux.sh -r -s \
+    && ./BuildLinux.sh -r -i
+
+# ---------------------------------------------------------------------------
+# Export stage: contains ONLY the AppImage. Built with
+#   --target export --output type=local,dest=dist
+# so the host receives dist/BambuStudio_ubu64.AppImage and nothing else.
+# ---------------------------------------------------------------------------
+FROM scratch AS export
+COPY --from=builder /src/build/BambuStudio_ubu64.AppImage /

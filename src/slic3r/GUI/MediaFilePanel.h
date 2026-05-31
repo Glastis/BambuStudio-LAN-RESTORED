@@ -89,6 +89,7 @@ private:
     std::string m_lan_ip;
     std::string m_lan_user;
     std::string m_lan_passwd;
+    std::string m_ftp_root;
     std::string m_dev_ver;
     bool        m_lan_mode      = false;
     bool        m_sdcard_exist  = false;
