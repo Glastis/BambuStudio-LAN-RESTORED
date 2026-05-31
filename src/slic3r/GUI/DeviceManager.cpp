@@ -1840,15 +1840,17 @@ int MachineObject::command_print_sdcard_file(const std::string &ftp_path, int pl
     j["print"]["ams_mapping"]    = "";
     j["print"]["use_ams"]        = use_ams;
 
+#if !BBL_RELEASE_TO_PUBLIC
     // Plaintext breadcrumb: studio log bodies are encrypted, so dump the exact
-    // command next to the FTPS cache for verification on real hardware. Safe to
-    // remove once the LAN SD-card print flow is confirmed working.
+    // command next to the FTPS cache for verification on real hardware. Debug-only;
+    // drop the whole block once the LAN SD-card print flow is confirmed working.
     try {
         boost::filesystem::path dbg = boost::filesystem::path(Slic3r::data_dir()) / "ftps_cache" / "last_sdcard_print_cmd.json";
         boost::filesystem::create_directories(dbg.parent_path());
         boost::filesystem::ofstream ofs(dbg, std::ios::trunc);
         ofs << j.dump(2);
     } catch (...) {}
+#endif
 
     BOOST_LOG_TRIVIAL(info) << "command_print_sdcard_file: " << j.dump();
     return this->publish_json(j);

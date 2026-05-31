@@ -206,10 +206,12 @@ public:
 
     void FetchModelCancel();
 
-    // Path to hand to the print job as dst_file. Transport-aware: in FTPS mode
-    // file.path keeps the FTP login-root prefix (e.g. "sdcard/") required for FTP
-    // transfers, but the printer's print command resolves the file relative to the
-    // SD-card root and re-adds that mount itself, so the prefix is stripped here.
+    // Path to hand to the print job as dst_file. Transport-aware: in FTPS mode the
+    // raw FTP-relative path (e.g. "sdcard/foo.3mf") is returned verbatim — it is the
+    // exact path FtpsClient used to download the file, and the LAN print command
+    // turns it into "ftp://<path>" which the printer resolves against its own FTP
+    // login root, so stripping the prefix would break resolution. In tunnel mode the
+    // historical leading '/' is stripped (preserves the previous cloud behaviour).
     std::string GetPrintFilePath(size_t index);
 
     size_t GetCount() const;
