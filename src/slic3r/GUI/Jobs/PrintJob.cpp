@@ -548,9 +548,28 @@ void PrintJob::process()
     };
 
     if (m_print_type == "from_sdcard_view") {
-        BOOST_LOG_TRIVIAL(info) << "print_job: try to send with cloud, model is sdcard view";
-        this->update_status(curr_percent, _L("Sending print job through cloud service"));
-        result = m_agent->start_sdcard_print(params, update_fn, cancel_fn);
+        if (obj && obj->is_lan_mode_printer()) {
+            // LAN-only: the cloud helper start_sdcard_print cannot resolve the file
+            // URL without the cloud tunnel, so the firmware rejects the job with HMS
+            // 05004002 ("Unsupported print file path or name"). Publish the
+            // project_file command ourselves over local MQTT, pointing at the
+            // on-board FTP path carried by params.dst_file.
+            BOOST_LOG_TRIVIAL(info) << "print_job: from_sdcard_view LAN-only, publish project_file locally, dst=" << params.dst_file;
+            this->update_status(curr_percent, _L("Sending print job over LAN"));
+            result = obj->command_print_sdcard_file(params.dst_file,
+                                                    this->m_print_from_sdc_plate_idx,
+                                                    params.task_bed_type,
+                                                    params.task_bed_leveling,
+                                                    params.task_flow_cali,
+                                                    params.task_vibration_cali,
+                                                    params.task_layer_inspect,
+                                                    params.task_record_timelapse,
+                                                    params.task_use_ams);
+        } else {
+            BOOST_LOG_TRIVIAL(info) << "print_job: try to send with cloud, model is sdcard view";
+            this->update_status(curr_percent, _L("Sending print job through cloud service"));
+            result = m_agent->start_sdcard_print(params, update_fn, cancel_fn);
+        }
     } else if (params.connection_type != "lan") {
         if (params.dev_ip.empty())
             params.comments = "no_ip";

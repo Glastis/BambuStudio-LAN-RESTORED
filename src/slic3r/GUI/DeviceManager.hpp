@@ -680,6 +680,14 @@ public:
     int command_set_printing_option(bool auto_recovery);
 
     int command_extruder_control(int nozzle_id, double val);
+    // LAN-only print of a file already present on the printer storage (SD card).
+    // ftp_path is the path relative to the FTP login root (e.g. "foo.gcode.3mf"
+    // on X1, "sdcard/model/foo.gcode.3mf" on P1/A1). Publishes the project_file
+    // MQTT command directly, bypassing the cloud-only start_sdcard_print helper.
+    int command_print_sdcard_file(const std::string &ftp_path, int plate_idx, const std::string &bed_type,
+                                  bool bed_leveling, bool flow_cali, bool vibration_cali,
+                                  bool layer_inspect, bool timelapse, bool use_ams);
+
     // calibration printer
     bool is_support_command_calibration();
     int command_start_calibration(bool vibration, bool bed_leveling, bool xcam_cali, bool motor_noise, bool nozzle_cali, bool bed_cali, bool clumppos_cali);

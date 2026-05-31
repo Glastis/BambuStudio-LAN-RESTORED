@@ -734,32 +734,17 @@ std::string PrinterFileSystem::GetPrintFilePath(size_t index)
 {
     File const & file = GetFile(index);
     std::string  path = file.path;
-    // Tunnel native paths historically carry a leading '/'; the print command
+    // FTPS (LAN-only): return the raw FTP-relative path verbatim. It is exactly the
+    // path FtpsClient uses to download the file, so it is known-good; the LAN print
+    // command turns it into a "ftp://<path>" URL that the printer resolves against
+    // its own FTP login root (the SD card). Stripping any prefix here would break
+    // that resolution.
+    if (m_transport == T_FTPS)
+        return path;
+    // Tunnel native paths historically carry a leading '/'; the cloud print command
     // wants it gone (preserves the previous MediaFilePanel behaviour).
     if (!path.empty() && path.front() == '/')
         path.erase(0, 1);
-    // FTPS: file.path keeps the FTP login-root prefix (e.g. "sdcard/") needed to
-    // transfer the file over FTP, but start_sdcard_print resolves dst_file
-    // relative to the SD-card root and re-adds that mount itself. Leaving the
-    // prefix in yields ".../sdcard/sdcard/..." which the firmware rejects with
-    // HMS 05004002 ("Unsupported print file path or name").
-    if (m_transport == T_FTPS) {
-        std::string root = FtpsRootDir(); // e.g. "sdcard/"
-        if (!root.empty() && path.compare(0, root.size(), root) == 0)
-            path.erase(0, root.size());
-    }
-    // Diagnostic breadcrumb: the studio log body is encrypted, so record the exact
-    // dst_file handed to the print job in a plaintext sidecar. Lets the path format
-    // be verified on real hardware; safe to remove once confirmed.
-    try {
-        boost::filesystem::path dbg = boost::filesystem::path(Slic3r::data_dir()) / "ftps_cache" / "last_sdcard_print_path.txt";
-        boost::filesystem::create_directories(dbg.parent_path());
-        boost::filesystem::ofstream ofs(dbg, std::ios::trunc);
-        ofs << "transport=" << (m_transport == T_FTPS ? "ftps" : "tunnel") << "\n"
-            << "raw_path="  << file.path << "\n"
-            << "ftp_root="  << FtpsRootDir() << "\n"
-            << "dst_file="  << path << "\n";
-    } catch (...) {}
     return path;
 }
 

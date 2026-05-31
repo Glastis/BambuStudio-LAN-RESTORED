@@ -34,6 +34,10 @@
 #include <wx/dir.h>
 #include "fast_float/fast_float.h"
 
+#include "libslic3r/Utils.hpp"            // Slic3r::data_dir() for the LAN print breadcrumb
+#include <boost/filesystem.hpp>
+#include <boost/filesystem/fstream.hpp>
+
 #include "DeviceCore/DevAxis.h"
 #include "DeviceCore/DevChamber.h"
 #include "DeviceCore/DevFilaSystem.h"
@@ -1794,6 +1798,60 @@ bool MachineObject::is_support_command_calibration()
         }
     }
     return true;
+}
+
+int MachineObject::command_print_sdcard_file(const std::string &ftp_path, int plate_idx, const std::string &bed_type,
+                                             bool bed_leveling, bool flow_cali, bool vibration_cali,
+                                             bool layer_inspect, bool timelapse, bool use_ams)
+{
+    // Start a print of a file already on the printer's storage while in LAN-only
+    // mode. The closed cloud helper (start_sdcard_print) cannot build a valid file
+    // URL without the cloud tunnel, so the firmware rejects the job with HMS
+    // 05004002 ("Unsupported print file path or name"). We instead publish the same
+    // "project_file" MQTT command the printer expects, pointing the url at the
+    // on-board FTP path. The printer resolves "ftp://<path>" against its own FTP
+    // login root (the SD card). This mirrors the proven LAN flow used by
+    // darkorb/bambu-ftp-and-print and the official cloud command schema.
+    int         idx  = plate_idx > 0 ? plate_idx : 1;
+    std::string name = boost::filesystem::path(ftp_path).filename().string();
+    std::string url  = "ftp://" + ftp_path;
+
+    json j;
+    j["print"]["sequence_id"]    = std::to_string(MachineObject::m_sequence_id++);
+    j["print"]["command"]        = "project_file";
+    j["print"]["param"]          = (boost::format("Metadata/plate_%1%.gcode") % idx).str();
+    j["print"]["project_id"]     = "0";
+    j["print"]["profile_id"]     = "0";
+    j["print"]["task_id"]        = "0";
+    j["print"]["subtask_id"]     = "0";
+    j["print"]["subtask_name"]   = name;
+    j["print"]["file"]           = "";
+    j["print"]["url"]            = url;
+    j["print"]["md5"]            = "";
+    j["print"]["timelapse"]      = timelapse;
+    j["print"]["bed_type"]       = bed_type.empty() ? std::string("auto") : bed_type;
+    j["print"]["bed_leveling"]   = bed_leveling;
+    j["print"]["flow_cali"]      = flow_cali;
+    j["print"]["vibration_cali"] = vibration_cali;
+    j["print"]["layer_inspect"]  = layer_inspect;
+    // ams_mapping intentionally left empty: the printer then honours the filament
+    // assignment embedded in the .3mf (i.e. the slicer's selection), which is the
+    // desired behaviour and avoids guessing the firmware's int-array mapping format.
+    j["print"]["ams_mapping"]    = "";
+    j["print"]["use_ams"]        = use_ams;
+
+    // Plaintext breadcrumb: studio log bodies are encrypted, so dump the exact
+    // command next to the FTPS cache for verification on real hardware. Safe to
+    // remove once the LAN SD-card print flow is confirmed working.
+    try {
+        boost::filesystem::path dbg = boost::filesystem::path(Slic3r::data_dir()) / "ftps_cache" / "last_sdcard_print_cmd.json";
+        boost::filesystem::create_directories(dbg.parent_path());
+        boost::filesystem::ofstream ofs(dbg, std::ios::trunc);
+        ofs << j.dump(2);
+    } catch (...) {}
+
+    BOOST_LOG_TRIVIAL(info) << "command_print_sdcard_file: " << j.dump();
+    return this->publish_json(j);
 }
 
 int MachineObject::command_start_calibration(bool vibration, bool bed_leveling, bool xcam_cali, bool motor_noise, bool nozzle_cali, bool bed_cali, bool clumppos_cali)
