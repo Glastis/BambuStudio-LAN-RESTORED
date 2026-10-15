@@ -32,20 +32,95 @@ list, preview, download, delete and **print** the files on the SD card, no cloud
 Bambu Studio can expose a [Model Context Protocol](https://modelcontextprotocol.io) server so that
 agents act on the live GUI exactly like a user would (every change shows up on screen and can be undone).
 
-Enable it in **Preferences → Allow AI agents to control Bambu Studio (MCP server)**. It listens on
-`http://127.0.0.1:13619/mcp` (loopback only, port configurable next to the checkbox). Then, for Claude Code:
+### 1. Install
+
+Download the AppImage from the [latest release](https://github.com/Glastis/BambuStudio-LAN-RESTORED/releases/latest)
+(MCP is available from `v02.07.00.56-lan`), make it executable and run it:
+
+```sh
+chmod +x BambuStudio-LAN-RESTORED-*-x86_64.AppImage
+./BambuStudio-LAN-RESTORED-*-x86_64.AppImage
+```
+
+Only Linux x86_64 is published; on other platforms build from source like upstream
+(`BuildLinux.sh`, `BuildMac.sh`, `build_win.bat`).
+
+### 2. Enable the server
+
+In **Preferences**, tick **Allow AI agents to control Bambu Studio (MCP server)**. The server starts
+immediately (no restart needed) and listens on `http://127.0.0.1:13619/mcp`, loopback only. The port can be
+changed in the **MCP server port** field next to the checkbox.
+
+Check that it answers:
+
+```sh
+curl -s http://127.0.0.1:13619/mcp -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | head -c 300
+```
+
+The server only runs while Bambu Studio is open: start the application before your agent.
+
+### 3. Connect your agent
+
+**Claude Code:**
 
 ```sh
 claude mcp add --transport http bambustudio http://127.0.0.1:13619/mcp
 ```
 
+Add `--scope user` to make it available in every project, then check it with `claude mcp list` (or `/mcp`
+inside a session).
+
+**Clients that accept an HTTP server in their JSON config** (Cursor, VS Code, Windsurf...):
+
+```json
+{
+  "mcpServers": {
+    "bambustudio": { "type": "http", "url": "http://127.0.0.1:13619/mcp" }
+  }
+}
+```
+
+**Clients that only launch stdio servers** (e.g. Claude Desktop's `claude_desktop_config.json`) can go
+through the [`mcp-remote`](https://www.npmjs.com/package/mcp-remote) bridge (requires Node.js):
+
+```json
+{
+  "mcpServers": {
+    "bambustudio": { "command": "npx", "args": ["-y", "mcp-remote", "http://127.0.0.1:13619/mcp"] }
+  }
+}
+```
+
+### Optional: bearer token
+
+Any local process can reach the port. To require a token, close Bambu Studio and add
+`"mcp_server_token": "<secret>"` to `BambuStudio.conf` (`~/.config/BambuStudio/` on Linux,
+`%APPDATA%\BambuStudio\` on Windows, `~/Library/Application Support/BambuStudio/` on macOS). Clients then
+send `Authorization: Bearer <secret>`:
+
+```sh
+claude mcp add --transport http bambustudio http://127.0.0.1:13619/mcp --header "Authorization: Bearer <secret>"
+```
+
+(`"headers": {"Authorization": "Bearer <secret>"}` in JSON configs, `--header "Authorization: Bearer <secret>"`
+after the URL for `mcp-remote`.) Requests carrying a non-local `Origin` header are always rejected, so web
+pages open in your browser cannot drive the server.
+
+### Usage
+
+Just ask in plain language, the agent picks the tools. For example:
+
+- *"Import ~/models/bracket.stl, lay it on its largest face and scale it to 120 %."*
+- *"Arrange plate 1, use 0.16 mm layers with tree supports only on the bracket, then slice and tell me
+  the print time and filament usage."*
+- *"Paint the seam on the back of the object and export the plate to ~/out/bracket.gcode.3mf."*
+- *"What is my X1C doing? Pause it if the nozzle temperature is below 200 °C."*
+
 Tools never display dialogs: the choices Bambu Studio would ask the user are explicit tool arguments
 (`discard_changes`, `unsaved_changes`, `run_post_process_scripts`...). Any other prompt raised internally is
 answered automatically (OK for information, Cancel/No for questions) and its text is returned to the agent.
-
-Any client speaking the Streamable HTTP transport works the same way. To require a token, set
-`"mcp_server_token": "<secret>"` in `BambuStudio.conf` and send `Authorization: Bearer <secret>`
-(`claude mcp add ... --header "Authorization: Bearer <secret>"`).
+Every edit goes through the regular undo stack, so **Ctrl+Z** reverts what the agent did.
 
 | Area | Tools |
 | --- | --- |
