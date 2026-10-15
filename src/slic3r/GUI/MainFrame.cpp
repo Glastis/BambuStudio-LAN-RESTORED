@@ -67,6 +67,7 @@
 #include "FilamentMapDialog.hpp"
 
 #include "DeviceCore/DevManager.h"
+#include "Mcp/McpServer.hpp"
 #include "slic3r/GUI/DeviceWeb/DeviceWebPage.hpp"
 
 #ifdef _WIN32
@@ -1056,6 +1057,8 @@ void MainFrame::update_layout()
 void MainFrame::shutdown()
 {
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << "MainFrame::shutdown enter";
+    // Stop serving MCP requests before the plater goes away.
+    Mcp::McpServer::instance().stop();
     // BBS: backup
     Slic3r::set_backup_callback(nullptr);
 #ifdef _WIN32

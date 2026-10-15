@@ -370,6 +370,16 @@ set(SLIC3R_GUI_SOURCES
     GUI/UserManager.cpp
     GUI/HttpServer.hpp
     GUI/HttpServer.cpp
+    GUI/Mcp/McpServer.hpp
+    GUI/Mcp/McpServer.cpp
+    GUI/Mcp/McpToolsCommon.hpp
+    GUI/Mcp/McpToolsCommon.cpp
+    GUI/Mcp/McpToolsProject.cpp
+    GUI/Mcp/McpToolsObjects.cpp
+    GUI/Mcp/McpToolsConfig.cpp
+    GUI/Mcp/McpToolsPaint.cpp
+    GUI/Mcp/McpToolsSlice.cpp
+    GUI/Mcp/McpToolsDevice.cpp
     Config/Snapshot.cpp
     Config/Snapshot.hpp
     Config/Version.cpp

@@ -324,6 +324,12 @@ void AppConfig::set_defaults()
         set_bool("camera_fullscreen_active_monitor_only", true);
     }
 
+    // MCP server for AI agents: off by default, loopback only.
+    if (get("mcp_server_enabled").empty())
+        set_bool("mcp_server_enabled", false);
+    if (get("mcp_server_port").empty())
+        set("mcp_server_port", "13619");
+
     if (get("ignore_ext_filament_in_filament_map").empty()){
         set_bool("ignore_ext_filament_in_filament_map", false);
     }

@@ -17,6 +17,7 @@
 #include <map>
 #include "Gizmos/GLGizmoBase.hpp"
 #include "OpenGLManager.hpp"
+#include "Mcp/McpServer.hpp"
 #ifdef __WINDOWS__
 #ifdef _MSW_DARK_MODE
 #include "dark_mode.hpp"
@@ -855,6 +856,9 @@ wxBoxSizer *PreferencesDialog::create_item_checkbox(wxString title, wxWindow *pa
             app_config->save();
         }
 
+        if (param == "mcp_server_enabled")
+            Mcp::McpServer::apply_app_config();
+
         if (param == "staff_pick_switch") {
             bool pbool = app_config->get("staff_pick_switch") == "true";
             wxGetApp().switch_staff_pick(pbool);
@@ -1331,6 +1335,10 @@ wxWindow* PreferencesDialog::create_general_page()
     auto item_beta_version_update = create_item_checkbox(_L("Support beta version update."), page, _L("With this option enabled, you can receive beta version updates."), 50, "enable_beta_version_update");
     auto item_mix_print_high_low_temperature = create_item_checkbox(_L("Remove the restriction on mixed printing of high and low temperature filaments."), page, _L("With this option enabled, you can print materials with a large temperature difference together."), 50, "enable_high_low_temp_mixed_printing");
     auto item_camera_fullscreen_active_monitor_only = create_item_checkbox(_L("Open full screen camera view on active monitor only."), page, _L("When enabled, the camera full screen view opens only on the monitor that contains Bambu Studio."), 50, "camera_fullscreen_active_monitor_only");
+    auto item_mcp_server = create_item_checkbox(_L("Allow AI agents to control Bambu Studio (MCP server)"), page,
+        _L("Starts a Model Context Protocol server on this computer only (127.0.0.1) so that AI agents such as Claude can open projects, place and edit objects, change settings, slice and read printer status. Endpoint: http://127.0.0.1:<port>/mcp"), 50, "mcp_server_enabled");
+    auto item_mcp_port = create_item_input(_L("MCP server port"), "", page, _L("TCP port of the MCP server (default 13619)."), "mcp_server_port",
+        [](wxString) { Mcp::McpServer::apply_app_config(); });
     auto item_restore_hide_pop_ups = create_item_button(_L("Clear my choice for synchronizing printer preset after loading the file."), _L("Clear"), page, {}, []() {
         wxGetApp().app_config->erase("app", "sync_after_load_file_show_flag");
     });
@@ -1500,6 +1508,8 @@ wxWindow* PreferencesDialog::create_general_page()
     sizer_page->Add(item_auto_transfer_when_switch_preset, 0, wxTOP, FromDIP(3));
     sizer_page->Add(item_mix_print_high_low_temperature, 0, wxTOP, FromDIP(3));
     sizer_page->Add(item_camera_fullscreen_active_monitor_only, 0, wxTOP, FromDIP(3));
+    sizer_page->Add(item_mcp_server, 0, wxTOP, FromDIP(3));
+    sizer_page->Add(item_mcp_port, 0, wxTOP, FromDIP(3));
     sizer_page->Add(item_restore_hide_pop_ups, 0, wxTOP, FromDIP(3));
     sizer_page->Add(item_restore_hide_3mf_info, 0, wxTOP, FromDIP(3));
     sizer_page->Add(_3d_settings, 0, wxTOP | wxEXPAND, FromDIP(20));

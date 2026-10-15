@@ -25,6 +25,38 @@ list, preview, download, delete and **print** the files on the SD card, no cloud
   thumbnails and a local cache.
 - **Print from SD** over local MQTT: the `project_file` command is published directly with an
   `ftp://` URL the printer resolves itself, instead of the cloud-only path that fails in LAN Only Mode.
+- **MCP server for AI agents**: Claude (or any MCP client) can drive the running Bambu Studio, see below.
+
+## AI agents (MCP)
+
+Bambu Studio can expose a [Model Context Protocol](https://modelcontextprotocol.io) server so that
+agents act on the live GUI exactly like a user would (every change shows up on screen and can be undone).
+
+Enable it in **Preferences → Allow AI agents to control Bambu Studio (MCP server)**. It listens on
+`http://127.0.0.1:13619/mcp` (loopback only, port configurable next to the checkbox). Then, for Claude Code:
+
+```sh
+claude mcp add --transport http bambustudio http://127.0.0.1:13619/mcp
+```
+
+Tools never display dialogs: the choices Bambu Studio would ask the user are explicit tool arguments
+(`discard_changes`, `unsaved_changes`, `run_post_process_scripts`...). Any other prompt raised internally is
+answered automatically (OK for information, Cancel/No for questions) and its text is returned to the agent.
+
+Any client speaking the Streamable HTTP transport works the same way. To require a token, set
+`"mcp_server_token": "<secret>"` in `BambuStudio.conf` and send `Authorization: Bearer <secret>`
+(`claude mcp add ... --header "Authorization: Bearer <secret>"`).
+
+| Area | Tools |
+| --- | --- |
+| Project | `get_app_state`, `new_project`, `open_project`, `save_project`, `import_models`, `undo`, `redo`, `screenshot` |
+| Plates | `list_plates`, `add_plate`, `delete_plate`, `select_plate`, `rename_plate` |
+| Objects | `list_objects`, `get_object`, `select_objects`, `transform_object` (move/rotate/scale/mirror), `move_to_plate`, `rename_object`, `duplicate_object`, `delete_objects`, `arrange`, `auto_orient` |
+| Settings | `search_settings`, `get_settings`, `set_settings` (global or per object/part, e.g. supports), `list_presets`, `select_preset` |
+| Filaments | `list_filaments`, `set_filament`, `add_filament`, `remove_filament`, `assign_filament` |
+| Painting | `paint_facets` (seams, supports, fuzzy skin, colours, by brush stroke / sphere / box / facing direction), `clear_painting`, `paint_info` |
+| Slicing | `slice`, `get_slice_result`, `export_gcode`, `export_sliced_3mf` |
+| Printers | `list_printers`, `get_printer_status` (job, temperatures, AMS, HMS), `select_printer`, `printer_control` (pause/resume/stop/light) |
 
 ## On security
 
